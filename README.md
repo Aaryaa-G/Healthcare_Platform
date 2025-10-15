@@ -57,5 +57,3 @@ A comprehensive healthcare management platform that facilitates patient care, do
 - **Craco**: Create React App Configuration Override
 - **ESLint**: Code linting and quality assurance
 - **PostCSS**: CSS processing and optimization
-
-# Here are your Instructions
