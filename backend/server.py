@@ -1,18 +1,35 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, BackgroundTasks, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, BackgroundTasks, Request, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
-from passlib.context import CryptContext
-from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone, date, time
 from typing import List, Optional, Dict, Any
 from pathlib import Path
-from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 import os
 import uuid
 import logging
+import pytz
+
+# Import local modules
+from config import *
+from database import db
+from models.auth import User, UserCreate, Token, TokenData, OTPVerify
+from routes import admin_router
+from dependencies import get_current_user
+from hipaa_compliance import HIPAACompliance
+from phi_encryption import PHIEncryption
+from email_service import EmailService
+
+# Initialize services
+email_service = EmailService()
+
+# Initialize HIPAA compliance and PHI encryption
+hipaa = HIPAACompliance()
+phi_encryption = PHIEncryption()
 
 # Import Stripe and SendGrid from emergentintegrations
 # from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
@@ -26,7 +43,7 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # JWT Configuration
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-here-change-in-production")
+SECRET_KEY = os.environ.get("1223", "1223")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -50,7 +67,10 @@ app = FastAPI(title="Medical Portal API", lifespan=lifespan)
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-# Add CORS middleware
+# Add security middlewares
+from hipaa_middleware import HIPAAMiddleware
+
+app.add_middleware(HIPAAMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -125,38 +145,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return User(**user)
 
-# Pydantic Models
-class User(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    email: EmailStr
-    full_name: str
-    role: str = "patient"  # patient, doctor, admin
-    phone: Optional[str] = None
-    specialization: Optional[str] = None  # for doctors
-    experience: Optional[str] = None  # for doctors
-    medical_history: Optional[List[str]] = []
-    allergies: Optional[List[str]] = []
-    medications: Optional[List[str]] = []
-    is_active: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class UserCreate(BaseModel):
-    email: EmailStr
-    password: str
-    full_name: str
-    role: str = "patient"
-    phone: Optional[str] = None
-    specialization: Optional[str] = None
-    experience: Optional[str] = None
-
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    user: User
+# Import models
+from models.auth import User, UserCreate, Token, TokenData, OTPVerify
 
 class Appointment(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -245,12 +235,22 @@ def send_appointment_reminder(user_email: str, appointment_details: dict):
     return True
 
 # Authentication endpoints
-@api_router.post("/auth/register", response_model=Token)
+@api_router.post("/auth/register", response_model=Dict[str, str])
 async def register(user: UserCreate):
     # Check if user already exists
     existing_user = await db.users.find_one({"email": user.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Generate OTP and send verification email
+    otp = email_service.generate_otp(user.email)
+    email_sent = await email_service.send_verification_email(user.email, otp)
+    
+    if not email_sent:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to send verification email"
+        )
     
     # Hash password and create user
     hashed_password = get_password_hash(user.password)
@@ -259,6 +259,7 @@ async def register(user: UserCreate):
     user_dict["hashed_password"] = hashed_password
     user_dict["id"] = str(uuid.uuid4())
     user_dict["created_at"] = datetime.now(timezone.utc)
+    user_dict["email_verified"] = False
     
     # Prepare for MongoDB
     user_dict = prepare_for_mongo(user_dict)
@@ -266,27 +267,66 @@ async def register(user: UserCreate):
     # Insert user
     await db.users.insert_one(user_dict)
     
+    return {
+        "message": "Registration initiated. Please check your email for verification code.",
+        "email": user.email
+    }
+
+@api_router.post("/auth/verify-email", response_model=Token)
+async def verify_email(verify_data: OTPVerify):
+    # Verify OTP
+    if not email_service.verify_otp(verify_data.email, verify_data.otp):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired verification code"
+        )
+    
+    # Update user's email verification status
+    result = await db.users.update_one(
+        {"email": verify_data.email},
+        {"$set": {"email_verified": True}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
+    # Get user data
+    user = await db.users.find_one({"email": verify_data.email})
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
+        data={"sub": verify_data.email},
+        expires_delta=access_token_expires
     )
     
     # Return user info without password
-    user_obj = User(**{k: v for k, v in user_dict.items() if k != "hashed_password"})
+    user_obj = User(**{k: v for k, v in user.items() if k != "hashed_password"})
     return Token(access_token=access_token, token_type="bearer", user=user_obj)
 
 @api_router.post("/auth/login", response_model=Token)
-async def login(user: UserLogin):
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     # Find user
-    db_user = await db.users.find_one({"email": user.email})
-    if not db_user or not verify_password(user.password, db_user["hashed_password"]):
+    db_user = await db.users.find_one({"email": form_data.username})
+    if not db_user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not verify_password(form_data.password, db_user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not db_user.get("email_verified", False):
+        raise HTTPException(status_code=400, detail="Email not verified. Please verify your email first.")
     
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
+        data={"sub": form_data.username}, expires_delta=access_token_expires
     )
     
     # Return user info without password
@@ -297,19 +337,148 @@ async def login(user: UserLogin):
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
+@api_router.put("/auth/me", response_model=User)
+async def update_me(
+    updates: Dict[str, Any],
+    current_user: User = Depends(get_current_user)
+):
+    # Fields that cannot be updated
+    protected_fields = {"id", "email", "role", "created_at", "hashed_password"}
+    update_data = {k: v for k, v in updates.items() if k not in protected_fields}
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Prepare for MongoDB
+    update_data = prepare_for_mongo(update_data)
+    
+    # Update user
+    result = await db.users.update_one(
+        {"id": current_user.id},
+        {"$set": update_data}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Update failed")
+    
+    # Get updated user
+    updated_user = await db.users.find_one({"id": current_user.id})
+    return User(**{k: v for k, v in updated_user.items() if k != "hashed_password"})
+
 # User endpoints
 @api_router.get("/users/doctors", response_model=List[User])
-async def get_doctors():
-    doctors = await db.users.find({"role": "doctor"}).to_list(length=None)
-    return [User(**{k: v for k, v in doctor.items() if k != "hashed_password"}) for doctor in doctors]
+async def get_doctors(
+    specialization: Optional[str] = None,
+    search: Optional[str] = None
+):
+    query = {"role": "doctor", "is_active": True}
+    
+    if specialization:
+        query["specialization"] = specialization
+    
+    if search:
+        query["$or"] = [
+            {"full_name": {"$regex": search, "$options": "i"}},
+            {"specialization": {"$regex": search, "$options": "i"}}
+        ]
+    
+    pipeline = [
+        {"$match": query},
+        {"$lookup": {
+            "from": "appointments",
+            "localField": "id",
+            "foreignField": "doctor_id",
+            "as": "appointments"
+        }},
+        {"$addFields": {
+            "total_appointments": {"$size": "$appointments"},
+            "rating": {"$avg": "$appointments.rating"}
+        }},
+        {"$project": {
+            "hashed_password": 0,
+            "appointments": 0
+        }}
+    ]
+    
+    doctors = await db.users.aggregate(pipeline).to_list(length=None)
+    return [User(**doctor) for doctor in doctors]
 
 @api_router.get("/users/patients", response_model=List[User])
-async def get_patients(current_user: User = Depends(get_current_user)):
+async def get_patients(
+    current_user: User = Depends(get_current_user),
+    search: Optional[str] = None
+):
     if current_user.role not in ["doctor", "admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    patients = await db.users.find({"role": "patient"}).to_list(length=None)
-    return [User(**{k: v for k, v in patient.items() if k != "hashed_password"}) for patient in patients]
+    query = {"role": "patient"}
+    
+    if search:
+        query["$or"] = [
+            {"full_name": {"$regex": search, "$options": "i"}},
+            {"email": {"$regex": search, "$options": "i"}}
+        ]
+    
+    if current_user.role == "doctor":
+        # Only return patients who have had appointments with this doctor
+        patient_ids = await db.appointments.distinct(
+            "patient_id",
+            {"doctor_id": current_user.id}
+        )
+        query["id"] = {"$in": patient_ids}
+    
+    pipeline = [
+        {"$match": query},
+        {"$lookup": {
+            "from": "appointments",
+            "localField": "id",
+            "foreignField": "patient_id",
+            "as": "appointments"
+        }},
+        {"$addFields": {
+            "total_appointments": {"$size": "$appointments"},
+            "last_visit": {"$max": "$appointments.appointment_date"}
+        }},
+        {"$project": {
+            "hashed_password": 0,
+            "appointments": 0
+        }}
+    ]
+    
+    patients = await db.users.aggregate(pipeline).to_list(length=None)
+    return [User(**patient) for patient in patients]
+
+@api_router.get("/users/{user_id}", response_model=User)
+async def get_user(
+    user_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    # Doctors can view their patients' profiles
+    # Patients can view their doctors' profiles
+    # Admins can view all profiles
+    if current_user.role not in ["admin"]:
+        if current_user.role == "doctor":
+            # Verify this is a patient who has an appointment with this doctor
+            appointment = await db.appointments.find_one({
+                "doctor_id": current_user.id,
+                "patient_id": user_id
+            })
+            if not appointment:
+                raise HTTPException(status_code=403, detail="Access denied")
+        elif current_user.role == "patient":
+            # Verify this is a doctor who has an appointment with this patient
+            appointment = await db.appointments.find_one({
+                "patient_id": current_user.id,
+                "doctor_id": user_id
+            })
+            if not appointment:
+                raise HTTPException(status_code=403, detail="Access denied")
+    
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return User(**{k: v for k, v in user.items() if k != "hashed_password"})
 
 # Appointment endpoints
 @api_router.post("/appointments", response_model=Appointment)
@@ -329,28 +498,85 @@ async def create_appointment(appointment: AppointmentCreate, current_user: User 
             detail="You have unpaid appointments. Please settle payment before booking a new appointment."
         )
     
+    # Check if the requested time slot is available
+    existing_appointment = await db.appointments.find_one({
+        "doctor_id": appointment.doctor_id,
+        "appointment_date": appointment.appointment_date,
+        "status": "scheduled"
+    })
+    
+    if existing_appointment:
+        raise HTTPException(
+            status_code=409,
+            detail="This time slot is already booked. Please choose another time."
+        )
+    
+    # Verify doctor exists and is active
+    doctor = await db.users.find_one({
+        "id": appointment.doctor_id,
+        "role": "doctor",
+        "is_active": True
+    })
+    
+    if not doctor:
+        raise HTTPException(
+            status_code=404,
+            detail="Doctor not found or is not available"
+        )
+    
     appointment_dict = appointment.dict()
     appointment_dict["patient_id"] = current_user.id
     appointment_dict["id"] = str(uuid.uuid4())
     appointment_dict["created_at"] = datetime.now(timezone.utc)
     appointment_dict["payment_status"] = "pending"  # Default to pending
     appointment_dict["status"] = "scheduled"  # Default status
+    appointment_dict["consultation_fee"] = 50.00  # Default fee
     
     # Prepare for MongoDB
     appointment_dict = prepare_for_mongo(appointment_dict)
     
     await db.appointments.insert_one(appointment_dict)
+    
+    # Send email notification to doctor (background task)
+    doctor_email = doctor.get("email")
+    if doctor_email:
+        try:
+            send_appointment_reminder(doctor_email, {
+                "patient_name": current_user.full_name,
+                "appointment_date": appointment.appointment_date,
+                "duration": appointment.duration_minutes
+            })
+        except Exception as e:
+            logger.error(f"Failed to send email notification: {str(e)}")
+    
     return Appointment(**appointment_dict)
 
 @api_router.get("/appointments", response_model=List[Appointment])
-async def get_appointments(current_user: User = Depends(get_current_user)):
+async def get_appointments(
+    status: Optional[str] = Query(None, enum=["scheduled", "completed", "cancelled"]),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
     query = {}
     if current_user.role == "patient":
         query["patient_id"] = current_user.id
     elif current_user.role == "doctor":
         query["doctor_id"] = current_user.id
     
-    appointments = await db.appointments.find(query).to_list(length=None)
+    if status:
+        query["status"] = status
+    
+    if date_from or date_to:
+        date_query = {}
+        if date_from:
+            date_query["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            date_query["$lte"] = datetime.fromisoformat(date_to)
+        if date_query:
+            query["appointment_date"] = date_query
+    
+    appointments = await db.appointments.find(query).sort("appointment_date", 1).to_list(length=None)
     return [Appointment(**parse_from_mongo(apt)) for apt in appointments]
 
 @api_router.put("/appointments/{appointment_id}", response_model=Appointment)
@@ -372,13 +598,30 @@ async def update_appointment(appointment_id: str, status: str, current_user: Use
 # Medical Records endpoints
 @api_router.post("/medical-records", response_model=MedicalRecord)
 async def create_medical_record(record: MedicalRecordCreate, current_user: User = Depends(get_current_user)):
-    if current_user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Only doctors can create medical records")
+    if not hipaa.verify_hipaa_authorization(current_user.role, "medical_records", "write"):
+        raise HTTPException(status_code=403, detail="HIPAA: Unauthorized access to medical records")
     
     record_dict = record.dict()
     record_dict["doctor_id"] = current_user.id
     record_dict["id"] = str(uuid.uuid4())
     record_dict["created_at"] = datetime.now(timezone.utc)
+    
+    # Encrypt sensitive PHI data
+    if record_dict.get("diagnosis"):
+        record_dict["diagnosis"] = phi_encryption.encrypt_phi(record_dict["diagnosis"])
+    if record_dict.get("treatment"):
+        record_dict["treatment"] = phi_encryption.encrypt_phi(record_dict["treatment"])
+    if record_dict.get("notes"):
+        record_dict["notes"] = phi_encryption.encrypt_phi(record_dict["notes"])
+    
+    # Log PHI access
+    hipaa.log_phi_access(
+        user_id=current_user.id,
+        action="create",
+        resource_type="medical_records",
+        resource_id=record_dict["id"],
+        additional_info={"patient_id": record_dict["patient_id"]}
+    )
     
     # Prepare for MongoDB
     record_dict = prepare_for_mongo(record_dict)
@@ -387,7 +630,15 @@ async def create_medical_record(record: MedicalRecordCreate, current_user: User 
     return MedicalRecord(**record_dict)
 
 @api_router.get("/medical-records", response_model=List[MedicalRecord])
-async def get_medical_records(patient_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
+async def get_medical_records(
+    patient_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    if not hipaa.verify_hipaa_authorization(current_user.role, "medical_records", "read"):
+        raise HTTPException(status_code=403, detail="HIPAA: Unauthorized access to medical records")
+    
     query = {}
     if current_user.role == "patient":
         query["patient_id"] = current_user.id
@@ -396,11 +647,118 @@ async def get_medical_records(patient_id: Optional[str] = None, current_user: Us
             query["patient_id"] = patient_id
         else:
             query["doctor_id"] = current_user.id
-    elif patient_id:
+    elif patient_id and current_user.role == "admin":
         query["patient_id"] = patient_id
+    else:
+        raise HTTPException(status_code=403, detail="HIPAA: Unauthorized access to medical records")
+        
+    # Log PHI access attempt
+    hipaa.log_phi_access(
+        user_id=current_user.id,
+        action="read",
+        resource_type="medical_records",
+        resource_id="multiple",
+        additional_info={"patient_id": patient_id if patient_id else current_user.id}
+    )
     
-    records = await db.medical_records.find(query).to_list(length=None)
-    return [MedicalRecord(**parse_from_mongo(record)) for record in records]
+    if date_from or date_to:
+        date_query = {}
+        if date_from:
+            date_query["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            date_query["$lte"] = datetime.fromisoformat(date_to)
+        if date_query:
+            query["created_at"] = date_query
+    
+    pipeline = [
+        {"$match": query},
+        {"$lookup": {
+            "from": "users",
+            "localField": "doctor_id",
+            "foreignField": "id",
+            "as": "doctor"
+        }},
+        {"$unwind": "$doctor"},
+        {"$project": {
+            "id": 1,
+            "patient_id": 1,
+            "doctor_id": 1,
+            "appointment_id": 1,
+            "diagnosis": 1,
+            "treatment": 1,
+            "notes": 1,
+            "file_urls": 1,
+            "created_at": 1,
+            "doctor_name": "$doctor.full_name",
+            "doctor_specialization": "$doctor.specialization"
+        }}
+    ]
+    
+    records = await db.medical_records.aggregate(pipeline).to_list(length=None)
+    
+    # Decrypt sensitive fields before returning
+    decrypted_records = []
+    for record in records:
+        try:
+            if record.get("diagnosis"):
+                record["diagnosis"] = phi_encryption.decrypt_phi(record["diagnosis"])
+            if record.get("treatment"):
+                record["treatment"] = phi_encryption.decrypt_phi(record["treatment"])
+            if record.get("notes"):
+                record["notes"] = phi_encryption.decrypt_phi(record["notes"])
+                
+            # Mask sensitive data based on user role
+            if current_user.role != "doctor":
+                record = hipaa.mask_sensitive_data(record)
+                
+            decrypted_records.append(record)
+        except Exception as e:
+            logging.error(f"Error decrypting record {record.get('id')}: {str(e)}")
+            continue
+    
+    return [MedicalRecord(**parse_from_mongo(record)) for record in decrypted_records]
+
+@api_router.put("/medical-records/{record_id}", response_model=MedicalRecord)
+async def update_medical_record(
+    record_id: str,
+    updates: Dict[str, Any],
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "doctor":
+        raise HTTPException(status_code=403, detail="Only doctors can update medical records")
+    
+    # Verify record exists and belongs to the doctor
+    record = await db.medical_records.find_one({
+        "id": record_id,
+        "doctor_id": current_user.id
+    })
+    
+    if not record:
+        raise HTTPException(status_code=404, detail="Medical record not found")
+    
+    # Remove protected fields
+    protected_fields = {"id", "patient_id", "doctor_id", "created_at"}
+    update_data = {k: v for k, v in updates.items() if k not in protected_fields}
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Prepare for MongoDB
+    update_data = prepare_for_mongo(update_data)
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    
+    # Update record
+    result = await db.medical_records.update_one(
+        {"id": record_id},
+        {"$set": update_data}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Update failed")
+    
+    # Get updated record
+    updated_record = await db.medical_records.find_one({"id": record_id})
+    return MedicalRecord(**parse_from_mongo(updated_record))
 
 # Prescription endpoints
 @api_router.post("/prescriptions", response_model=Prescription)
@@ -420,7 +778,12 @@ async def create_prescription(prescription: PrescriptionCreate, current_user: Us
     return Prescription(**prescription_dict)
 
 @api_router.get("/prescriptions", response_model=List[Prescription])
-async def get_prescriptions(patient_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
+async def get_prescriptions(
+    patient_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
     query = {}
     if current_user.role == "patient":
         query["patient_id"] = current_user.id
@@ -432,8 +795,89 @@ async def get_prescriptions(patient_id: Optional[str] = None, current_user: User
     elif patient_id:
         query["patient_id"] = patient_id
     
-    prescriptions = await db.prescriptions.find(query).to_list(length=None)
+    if date_from or date_to:
+        date_query = {}
+        if date_from:
+            date_query["$gte"] = datetime.fromisoformat(date_from)
+        if date_to:
+            date_query["$lte"] = datetime.fromisoformat(date_to)
+        if date_query:
+            query["created_at"] = date_query
+    
+    pipeline = [
+        {"$match": query},
+        {"$lookup": {
+            "from": "users",
+            "localField": "doctor_id",
+            "foreignField": "id",
+            "as": "doctor"
+        }},
+        {"$unwind": "$doctor"},
+        {"$lookup": {
+            "from": "users",
+            "localField": "patient_id",
+            "foreignField": "id",
+            "as": "patient"
+        }},
+        {"$unwind": "$patient"},
+        {"$project": {
+            "id": 1,
+            "patient_id": 1,
+            "doctor_id": 1,
+            "appointment_id": 1,
+            "medications": 1,
+            "instructions": 1,
+            "created_at": 1,
+            "doctor_name": "$doctor.full_name",
+            "doctor_specialization": "$doctor.specialization",
+            "patient_name": "$patient.full_name"
+        }}
+    ]
+    
+    prescriptions = await db.prescriptions.aggregate(pipeline).to_list(length=None)
     return [Prescription(**parse_from_mongo(prescription)) for prescription in prescriptions]
+
+@api_router.put("/prescriptions/{prescription_id}", response_model=Prescription)
+async def update_prescription(
+    prescription_id: str,
+    updates: Dict[str, Any],
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "doctor":
+        raise HTTPException(status_code=403, detail="Only doctors can update prescriptions")
+    
+    # Verify prescription exists and belongs to the doctor
+    prescription = await db.prescriptions.find_one({
+        "id": prescription_id,
+        "doctor_id": current_user.id
+    })
+    
+    if not prescription:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+    
+    # Remove protected fields
+    protected_fields = {"id", "patient_id", "doctor_id", "created_at"}
+    update_data = {k: v for k, v in updates.items() if k not in protected_fields}
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Prepare for MongoDB
+    update_data = prepare_for_mongo(update_data)
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    
+    # Update prescription
+    result = await db.prescriptions.update_one(
+        {"id": prescription_id},
+        {"$set": update_data}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Update failed")
+    
+    # Get updated prescription
+    updated_prescription = await db.prescriptions.find_one({"id": prescription_id})
+    return Prescription(**parse_from_mongo(updated_prescription))
 
 # Chat endpoints
 @api_router.post("/chat/messages", response_model=ChatMessage)
