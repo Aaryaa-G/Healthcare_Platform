@@ -36,7 +36,8 @@ const Register = () => {
     const result = await register(formData);
     
     if (result.success) {
-      toast.success(`Welcome to MedConnect, ${result.user.full_name}!`);
+      // Backend returns a message indicating registration initiated (OTP sent)
+      toast.success(result.message || 'Registration initiated. Check your email for verification code.');
     } else {
       toast.error(result.error);
     }

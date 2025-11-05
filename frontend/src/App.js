@@ -65,7 +65,13 @@ const AuthProvider = ({ children }) => {
 
   const login = async (email, password) => {
     try {
-      const response = await axios.post('/auth/login', { email, password });
+      // OAuth2PasswordRequestForm expects form-encoded fields: username and password
+      const params = new URLSearchParams();
+      params.append('username', email);
+      params.append('password', password);
+      const response = await axios.post('/auth/login', params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
       const { access_token, user: userData } = response.data;
       
       localStorage.setItem('token', access_token);
@@ -74,28 +80,67 @@ const AuthProvider = ({ children }) => {
       
       return { success: true, user: userData };
     } catch (error) {
-      return { 
-        success: false, 
-        error: error.response?.data?.detail || 'Login failed' 
+      // Normalize error messages (FastAPI returns validation errors as an array under `detail`)
+      let errorMsg = 'Login failed';
+      if (error?.response?.data) {
+        const data = error.response.data;
+        if (data.detail) {
+          if (Array.isArray(data.detail)) {
+            errorMsg = data.detail.map(d => d.msg || JSON.stringify(d)).join('; ');
+          } else if (typeof data.detail === 'string') {
+            errorMsg = data.detail;
+          } else {
+            errorMsg = JSON.stringify(data.detail);
+          }
+        } else if (data.error) {
+          errorMsg = data.error;
+        }
+      } else if (error.message) {
+        errorMsg = error.message;
+      }
+
+      return {
+        success: false,
+        error: errorMsg,
       };
     }
   };
 
   const register = async (userData) => {
     try {
-      const response = await axios.post('/auth/register', userData);
-      const { access_token, user: newUser } = response.data;
-      
-      localStorage.setItem('token', access_token);
-      axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`;
-      setUser(newUser);
-      
-      return { success: true, user: newUser };
+      // backend expects fields matching UserCreate (email, password, optional first_name/last_name, role, phone)
+      // frontend sends `full_name`; split it into first_name/last_name to satisfy the backend model
+      const payload = { ...userData };
+      if (payload.full_name && !payload.first_name && !payload.last_name) {
+        const parts = payload.full_name.trim().split(/\s+/);
+        payload.first_name = parts.shift() || '';
+        payload.last_name = parts.join(' ') || '';
+        delete payload.full_name;
+      }
+
+      const response = await axios.post('/auth/register', payload);
+      // Registration flow returns a message (and email) and does not auto-login. Show that to the caller.
+      return { success: true, message: response.data.message || 'Registration initiated. Check your email.' };
     } catch (error) {
-      return { 
-        success: false, 
-        error: error.response?.data?.detail || 'Registration failed' 
-      };
+      let errorMsg = 'Registration failed';
+      if (error?.response?.data) {
+        const data = error.response.data;
+        if (data.detail) {
+          if (Array.isArray(data.detail)) {
+            errorMsg = data.detail.map(d => d.msg || JSON.stringify(d)).join('; ');
+          } else if (typeof data.detail === 'string') {
+            errorMsg = data.detail;
+          } else {
+            errorMsg = JSON.stringify(data.detail);
+          }
+        } else if (data.error) {
+          errorMsg = data.error;
+        }
+      } else if (error.message) {
+        errorMsg = error.message;
+      }
+
+      return { success: false, error: errorMsg };
     }
   };
 

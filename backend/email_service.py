@@ -1,5 +1,6 @@
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Email, To, Content
+import asyncio
 from datetime import datetime
 import os
 import random
@@ -11,7 +12,10 @@ logger = logging.getLogger(__name__)
 
 class EmailService:
     def __init__(self):
-        self.sg = SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
+        api_key = os.environ.get('SENDGRID_API_KEY')
+        # If no API key is configured, don't attempt to call SendGrid in dev/test.
+        # This lets local development proceed without failing registration.
+        self.sg = SendGridAPIClient(api_key=api_key) if api_key else None
         self.from_email = Email(os.environ.get('SENDGRID_FROM_EMAIL', 'noreply@medconnect.com'))
         self._otp_store = {}  # In production, use Redis or another persistent store
 
@@ -69,7 +73,12 @@ class EmailService:
         )
         
         try:
-            response = await self.sg.send(message)
+            if not self.sg:
+                # Development fallback: log the OTP and return success so registration can continue
+                logger.info(f"SENDGRID_API_KEY not set - skipping email send. OTP for {email}: {otp}")
+                return True
+            # SendGrid client is blocking; run in a thread to avoid blocking the event loop
+            response = await asyncio.to_thread(self.sg.send, message)
             return response.status_code == 202
         except Exception as e:
             logger.error(f"Failed to send verification email: {str(e)}")
@@ -116,7 +125,10 @@ class EmailService:
         )
         
         try:
-            response = await self.sg.send(message)
+            if not self.sg:
+                logger.info(f"SENDGRID_API_KEY not set - skipping appointment email to {email}")
+                return True
+            response = await asyncio.to_thread(self.sg.send, message)
             return response.status_code == 202
         except Exception as e:
             logger.error(f"Failed to send appointment notification: {str(e)}")
